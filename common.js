@@ -12,30 +12,38 @@ var admin_fee;
 const trade_timeout = 1800;
 const max_allowance = BigInt(2) ** BigInt(256) - BigInt(1);
 
-async function ensure_allowance(_amounts) {
-    var default_account = (await web3.eth.getAccounts())[0];
-    var amounts;
-    if (_amounts == null) {
-        amounts = new Array(N_COINS);
-        for (let i=0; i < N_COINS; i++)
-            amounts[i] = max_allowance.toString();
-    } else
-        amounts = _amounts;
-    for (let i=0; i < N_COINS; i++) {
-        var current_allowance = parseInt(await coins[i].methods.allowance(default_account, swap_address).call());
-        if ((current_allowance < wallet_balances[i]) & (amounts[i] != 0)) {
-            if (current_allowance != 0)
-                await new Promise(resolve => {
-                    coins[i].methods.approve(swap_address, 0)
-                    .send({'from': default_account, 'gas': 100000})
-                    .once('transactionHash', function(hash) {resolve(true);});
-                });
-
-            await new Promise(resolve => {
-                coins[i].methods.approve(swap_address, amounts[i])
-                .send({'from': default_account, 'gas': 100000})
+function approve(contract, amount, account) {
+    return new Promise(resolve => {
+                contract.methods.approve(swap_address, amount.toString())
+                .send({'from': account, 'gas': 100000})
                 .once('transactionHash', function(hash) {resolve(true);});
             });
+}
+
+async function ensure_allowance(amounts) {
+    var default_account = (await web3.eth.getAccounts())[0];
+    var allowances = new Array(N_COINS);
+    for (let i=0; i < N_COINS; i++)
+        allowances[i] = await coins[i].methods.allowance(default_account, swap_address).call();
+
+    if (amounts) {
+        // Non-infinite
+        for (let i=0; i < N_COINS; i++) {
+            if (allowances[i] < amounts[i]) {
+                if (allowances[i] > 0)
+                    await approve(coins[i], 0, default_account);
+                await approve(coins[i], amounts[i], default_account);
+            }
+        }
+    }
+    else {
+        // Infinite
+        for (let i=0; i < N_COINS; i++) {
+            if (allowances[i] < max_allowance / BigInt(2)) {
+                if (allowances[i] > 0)
+                    await approve(coins[i], 0, default_account);
+                await approve(coins[i], max_allowance, default_account);
+            }
         }
     }
 }
@@ -51,18 +59,10 @@ async function ensure_underlying_allowance(i, _amount) {
     if ((_amount == max_allowance) & (current_allowance > max_allowance / BigInt(2)))
         return false;  // It does get spent slowly, but that's ok
 
-    if (current_allowance != 0)
-        await new Promise(resolve => {
-            underlying_coins[i].methods.approve(swap_address, 0)
-            .send({'from': default_account, 'gas': 100000})
-            .once('transactionHash', function(hash) {resolve(true);});
-        });
+    if ((current_allowance > 0) & (current_allowance < amount))
+        await approve(underlying_coins[i], 0, default_account);
 
-    return new Promise(resolve => {
-        underlying_coins[i].methods.approve(swap_address, amount.toString())
-        .send({'from': default_account, 'gas': 100000})
-        .once('transactionHash', function(hash) {resolve(true);});
-    })
+    return await approve(underlying_coins[i], amount, default_account);
 }
 
 // XXX not needed anymore
@@ -82,16 +82,7 @@ async function ensure_token_allowance() {
 
 async function init_contracts() {
     web3.eth.net.getId((err, result) => {
-        if (result == 1) {
-            if (web3.currentProvider.constructor.name == 's') {
-                $('#error-window').text('Error: please use Metamask to do transactions');
-                $('#error-window').show();
-            }
-            else
-                $('#error-window').hide();
-        }
-        else
-        {
+        if(result != 1) {
             $('#error-window').text('Error: wrong network type. Please switch to mainnet');
             $('#error-window').show();
         }
@@ -130,11 +121,21 @@ async function update_fee_info() {
     var bal_info = $('#balances-info li span');
     await update_rates();
     var total = 0;
+    var promises = [];
+    let infuraProvider = new Web3(infura_url)
+    swapInfura = new infuraProvider.eth.Contract(swap_abi, swap_address);
     for (let i = 0; i < N_COINS; i++) {
-        balances[i] = parseInt(await swap.methods.balances(i).call());
+        promises.push(swapInfura.methods.balances(i).call())
+/*        balances[i] = parseInt(await swap.methods.balances(i).call());
+        $(bal_info[i]).text((balances[i] * c_rates[i]).toFixed(2));
+        total += balances[i] * c_rates[i];*/
+    }
+    let resolves = await Promise.all(promises)
+    resolves.forEach((balance, i) => {
+        balances[i] = +balance;
         $(bal_info[i]).text((balances[i] * c_rates[i]).toFixed(2));
         total += balances[i] * c_rates[i];
-    }
+    })
     $(bal_info[N_COINS]).text(total.toFixed(2));
     fee = parseInt(await swap.methods.fee().call()) / 1e10;
     admin_fee = parseInt(await swap.methods.admin_fee().call()) / 1e10;
@@ -157,4 +158,68 @@ async function update_fee_info() {
             $('#lp-info-container').show();
         }
     }
+}
+
+async function calc_slippage(deposit) {
+    var real_values = [...$("[id^=currency_]")].map((x,i) => +($(x).val()));
+    var Sr = real_values.reduce((a,b) => a+b, 0);
+    var values = real_values.map((x,i) => BigInt(Math.floor(x / c_rates[i])).toString());
+    var ones = c_rates.map((rate, i) => BigInt(Math.floor(1.0 / rate / N_COINS)).toString());
+    var token_amount = await swap.methods.calc_token_amount(values, deposit).call();
+    var ideal_token_amount = parseInt(await swap.methods.calc_token_amount(ones, deposit).call()) * Sr;
+    var token_supply = parseInt(await swap_token.methods.totalSupply().call());
+    for(let i = 0; i < N_COINS; i++) {
+        let coin_balance = parseInt(await swap.methods.balances(i).call()) * c_rates[i];
+        if(!deposit) {
+            if(coin_balance < real_values[i]) {
+                $("#nobalance-warning").show();
+                $("#nobalance-warning span").text($("label[for='currency_"+i+"']").text());
+            }
+            else
+                $("#nobalance-warning").hide();
+        }
+    }
+    if (deposit)
+        slippage = token_amount / ideal_token_amount
+    else
+        slippage = ideal_token_amount / token_amount;
+    slippage = slippage - 1;
+    slippage = slippage || 0
+    console.log(slippage)
+    if(slippage < -0.005) {
+        $("#bonus-window").hide();
+        $("#highslippage-warning").removeClass('info-message').addClass('simple-error');
+        $("#highslippage-warning .text").text("Warning! High slippage");
+        $("#highslippage-warning .percent").text((-slippage * 100).toFixed(3));
+        $("#highslippage-warning").show();
+    }
+    else if(slippage > 0) {
+        $("#highslippage-warning").hide();
+        $("#bonus-window").show();
+        $("#bonus-window span").text((slippage * 100).toFixed(3));
+    }
+    else if(slippage <= 0) {
+        $("#bonus-window").hide();
+        $("#highslippage-warning").removeClass('simple-error').addClass('info-message');
+        $("#highslippage-warning .text").text("Slippage");
+        $("#highslippage-warning .percent").text((-slippage * 100).toFixed(3));
+        $("#highslippage-warning").show();
+    }
+    else {
+      $("#bonus-window").hide();
+      $("#highslippage-warning").hide();
+    }
+}
+
+function debounced(delay, fn) {
+  let timerId;
+  return function (...args) {
+    if (timerId) {
+      clearTimeout(timerId);
+    }
+    timerId = setTimeout(() => {
+      fn(...args);
+      timerId = null;
+    }, delay);
+  }
 }
